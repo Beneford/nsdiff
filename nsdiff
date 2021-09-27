@@ -1,0 +1,375 @@
+#!/bin/bash
+#
+# nsdiff - will use a BIND Zone File and check that DNS is actually correct
+#
+iam=${0##*/}
+
+verbose=0
+server=""
+showResult=FALSE
+while [ "${1:0:1}" == "-" ]; do
+	if [ "$1" == "-v" ]; then
+		verbose=$(( $verbose + 1))
+	fi
+	if [ "$1" == "-r" ]; then
+		showResult=TRUE
+	fi
+	if [ "$1" == "-s" ]; then
+		server=@$2
+		shift
+	fi
+	shift
+done
+
+if [ "${1:0:1}" == "@" ]; then
+	server=$1
+	shift
+fi
+
+if [ -f $1 ]; then
+	zonefile=$1
+else
+	zonefile=$iam.zone
+fi
+
+if [ "$1" == "" ]; then
+	echo "Usage: $iam [-s server] [-v] [-r] zonefile"
+	echo "	Compare the zone file with the DNS lookup."
+	echo "	-s server	DNS will look up through that server."
+	echo "			or use @server."
+	echo "	-r 		always show the results returned."
+	echo "	-v		verbose output"
+	exit
+fi
+
+[ $verbose -gt 0 ] && echo "Checking $zonefile against server $server"
+
+#          !";*   ( " !"*  "  !";*  )*;
+comment="^([^\";]*(\"[^\"]*\"[^\";]*)*);.*"
+openBracket='.*\([^\)]*$'
+ttlPattern='^[0-9]+[smhdw]{0,1}$'
+classList='|NS|A|TXT|AAAA|TXT|MX|CNAME|SRV|SOA|'
+IPv4Pattern=^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$
+function ttl2seconds {
+	if [[ $1 =~ $ttlPattern ]]; then
+		modifier=${1: -1}
+		value=${1/$modifier/}
+		if [[ $modifier =~ [0-9] ]]; then
+			modifier='s'
+			value=$1
+		fi
+		[ $modifier == m ] && value=$(( $value * 60 ))
+		[ $modifier == h ] && value=$(( $value * 60 * 60 ))
+		[ $modifier == d ] && value=$(( $value * 60 * 60 * 24 ))
+		[ $modifier == w ] && value=$(( $value * 60 * 60 * 24 * 7 ))
+		echo "$value"
+	else
+		echo 0
+	fi
+}
+
+DOTreplace=DOT
+HYPHENreplace=HYPH
+function findHost {
+	targetName=host$1
+#	echo "findHost $1" >> /dev/stderr
+	# Note: ${!name} is indirection: its value is that of the variable whose name is $name
+	# Try three times: with $1 as given; $1. and $1 without a trailing .
+	[ "${!targetName}" == "" ] && targetName=host$1$DOTreplace 
+	[ "${!targetName}" == "" ] && targetName=host${1%$DOTreplace}
+	if [ "${!targetName}" == "" ]; then
+		echo $1
+	else
+		# Finally, we search deeper
+		echo $( findHost ${!targetName})
+	fi
+}
+
+# return YES or NO if parameter is valid IPv4 address
+function isIP {
+	if [[ $1 =~ $IPv4Pattern ]]; then
+		xIFS=$IFS
+		IFS='.'
+		ip=($1)
+		IFS=$xIFS
+#		echo "0:${ip[0]}; 1:${ip[1]}; 2:${ip[2]}; 3:${ip[3]};" >> /dev/stderr
+		if [[ ${ip[0]} -le 255 && ${ip[1]} -le 255 && ${ip[2]} -le 255 && ${ip[3]} -le 255 ]]; then
+			echo "YES"
+		else
+			echo "NO"
+		fi 
+	else
+		echo "NO"
+	fi
+}
+
+clrRed='\033[1;31m'
+clrGreen='\033[1;32m'
+clrBlue='\033[1;34m'
+clrAmber='\033[0;33m'
+clrOff='\033[0m'
+data=""
+ccNext=FALSE
+ttl=3600
+lastName=@
+while read line; do
+	[ $verbose -gt 0 ] && echo "Line: $line"
+	
+	# Process comments without losing quoted strings containing ';'
+	if [[ $line =~ $comment ]]; then
+		thisdata=${BASH_REMATCH[1]}
+	else
+		thisdata=$line
+	fi
+	# Lose any CR/LF characters
+	thisdata=${thisdata//[$'\r\n']}
+
+	# Bring bracketed lists onto the same line
+	if [ $ccNext == TRUE ]; then
+		data="$data $thisdata"
+	else
+		data="$thisdata" 
+	fi
+	[ "$thisdata" == "" ] && continue
+	if [[ $data =~ $openBracket ]]; then
+		ccNext=TRUE
+	else
+		ccNext=FALSE
+		if [ $verbose -gt 1 ]; then
+			[ "$data" != "" ] && echo "Data: $data"
+		fi
+		# $data now contains the line we want to check
+
+		# Check for $TTL and $ORIGIN
+		values=($data)
+		p=${values[0]}
+		if [ "${p:0:1}" == "$" ]; then
+			if [ "$p" == "\$TTL" ]; then
+				ttl=$(ttl2seconds ${values[1]})
+				[ $verbose -gt 0 ] && echo "TTL = $ttl"
+			fi
+			if [ "$p" == "\$ORIGIN" ]; then
+				origin=${values[1]}
+				[ $verbose -gt 0 ] && echo "ORIGIN = $origin"
+			fi
+			data=""
+			continue
+		fi
+
+		# We only recognise the record class IN - others are ignored
+
+		# if IN is not specified, assume it
+		search="|${values[0]}|"
+		[[ $classList =~ ${values[0]} ]] && data="IN $data"
+		values=($data)
+
+		# if IN comes first, use the origin
+		[ "${values[0]}" == "IN" ] && data="$origin $data"
+		# replace @ with origin
+		data=${data/@/$origin}
+		values=($data)
+
+		# add the ttl if not present
+		# Case 1: values[1] = IN
+		if [ "${values[1]}" == "IN" ]; then
+			# Case 1a: values[0] is a time value
+			ttl0=$(ttl2seconds ${values[0]})
+			if [ $ttl0 -gt 0 ]; then
+				data="$lastName $ttl0 ${values[@]:1}"
+			else
+				data="${values[0]} $ttl ${values[@]:1}"
+			fi
+		fi
+		values=($data)
+
+		# Convert TTL to seconds
+		thisttl=$( ttl2seconds ${values[1]} )
+		if [ $thisttl -ne 0 ]; then
+			data="${values[0]} $thisttl ${values[@]:2}"
+		fi
+
+		# convert sub-domains to FQDN
+		[ "${values[0]: -1}" == "." ] || [ "${values[0]}" == "$origin" ] || data="${values[0]}.$origin ${values[@]:1}"
+		values=($data)
+		echo -n "${values[@]}"
+		notDone=TRUE
+		recordsTried=""
+
+		rr=${values[3]}
+		if [ $rr == A ] || [ $rr == CNAME ]; then
+			rr=""
+		else
+			rr="-t $rr"
+		fi
+		cmd="dig +noall +answer $server $rr -q ${values[0]}"
+#		[[ "${values[0]}" == *"$origin" ]] || cmd="$cmd -q ${values[0]}.$origin"
+		if [ $verbose -gt 1 ]; then
+			echo ""
+			echo "Cmd: $cmd"
+		fi
+		dig="$($cmd)"
+		IFS=$'\n'
+		answers=( $dig )
+		unset IFS
+		c=0
+		match=0
+		MXlevelOK=FALSE
+		resultGiven=FALSE
+		nameOK=FALSE
+		ttlOK=FALSE
+		targetOK=FALSE
+		for answer in "${answers[@]}"; do
+			c=$(( $c + 1 ))
+			a=(${answer//\\})
+			[ $verbose -gt 2 ] && echo "Dig ($c):  ${a[@]}"
+			# Compare the values
+			# Name - may have a '.' on the end
+			nameOK=FALSE
+			ttlOK=FALSE
+			RROK=FALSE
+			targetOK=FALSE
+			if [ ${#answer} -gt 5 ]; then
+			    if [ ${values[0]} == ${a[0]} ] \
+			    || [ ${values[0]}\. == ${a[0]} ]; then
+				nameOK=TRUE
+			    fi
+			    if [ ${values[1]} -gt ${a[1]} ]; then
+				ttlOK=TRUE
+			    else
+				ttlOK=TTLWrong
+			    fi
+			    # value[2] = IN
+			    if [ ${values[3]} == ${a[3]} ]; then
+				RROK=TRUE
+			    fi
+			    case ${values[3]} in
+				TXT|SPF)
+				    [ "${values[4]}" == "${a[4]}" ] && targetOK=TRUE
+				    if [ ${#a[@]} -gt 4 ]; then
+				    for i in $(eval echo "{5..${#values[@]}}"); do
+				        [ "${values[$i]}" == "${a[$i]}" ] || targetOK=FALSE
+				    done
+				    fi
+				    ;;
+				MX)
+#				    echo "" && echo "v4:${values[4]}; a4:${a[4]}; v5:${values[5]}; a5:${a[5]}; origin:$origin"
+				    [[ ${a[4]} =~ ^[0-9]+$ ]] && [ ${values[4]} -eq ${a[4]} ] && MXlevelOK=TRUE
+				    [ "${values[5]}" == "${a[5]}" ] && targetOK=TRUE
+				    [ "${values[5]}." == "${a[5]}" ] && targetOK=TRUE
+				    [ "${values[5]}.$origin" == "${a[5]}" ] && targetOK=TRUE
+				    [ "${values[5]}.$origin." == "${a[5]}" ] && targetOK=TRUE
+				    IPOK=$(isIP ${values[5]})
+				    [ $IPOK == YES ] && targetOK=TRUE
+				    ;;
+				SOA)
+				    targetOK=Maybe
+				    ;;
+				SRV)
+				    # For SRV, we ignore the first two parameters
+				    [ ${values[6]} == ${a[6]} ] && [ ${values[7]} == ${a[7]} ] && targetOK=TRUE
+				    ;;
+				PTR)
+				    [ "${values[4]}" == "${a[4]}" ] && targetOK=TRUE
+				    ;;
+				NS)
+#				    echo "" && echo "Type=${values[3]}; v4:${values[4]}; a4:${a[4]}; v0:${values[0]}; a0:${a[0]};"
+				    thisValue=${values[4]//\./$DOTreplace}
+				    thisValue=${thisValue//\-/$HYPHENreplace}
+				    vTarget=$( findHost $thisValue )
+				    thisA=${a[4]//\./$DOTreplace}
+				    thisA=${thisA//\-/$HYPHENreplace}
+				    aTarget=$( findHost $thisA )
+#				    echo "vTarget:${vTarget}; aTarget:${aTarget};"
+				    [ "$vTarget" == "$aTarget" ] && targetOK=TRUE
+				    [ "$vTarget$DOTreplace" == "$aTarget" ] && targetOK=TRUE
+				    ;;
+				A|CNAME) # For A and CNAME we trace already-known hosts
+				    targetOK=IPWrong
+#				    echo "" && echo "Type=${values[3]}; v4:${values[4]}; a4:${a[4]}; v0:${values[0]}; a0:${a[0]};"
+				    thisValue=${values[4]//\./$DOTreplace}
+				    thisValue=${thisValue//\-/$HYPHENreplace}
+				    vTarget=$( findHost $thisValue )
+				    thisA=${a[4]//\./$DOTreplace}
+				    thisA=${thisA//\-/$HYPHENreplace}
+				    aTarget=$( findHost $thisA )
+#				    echo "vTarget:${vTarget}; aTarget:${aTarget};"
+				    [ "$vTarget" == "$aTarget" ] && targetOK=TRUE
+				    [ "$vTarget$DOTreplace" == "$aTarget" ] && targetOK=TRUE
+				    if [ $targetOK == IPWrong ]; then
+					# For CNAME, we also accept the form x.domain.com CNAME y
+					# where y stands for y.domain.com
+					if [ ${values[4]##.*} == ${values[4]} ]; then
+					    thisValue=${values[4]}.${values[0]#*.}
+					    thisValue=${thisValue//\./$DOTreplace}
+					    thisValue=${thisValue//\-/$HYPHENreplace}
+					    vTarget=$( findHost $thisValue )
+					    [ "$vTarget" == "$aTarget" ] && targetOK=TRUE
+					    [ "$vTarget$DOTreplace" == "$aTarget" ] && targetOK=TRUE
+					fi
+				    fi
+				    if [ $targetOK == IPWrong ]; then
+					cmd="dig +noall +answer $server $rr -q ${values[4]}"
+					[ $verbose -gt 1 ] && echo "Lookup: $cmd"
+					dig="$($cmd)"
+					lookup=(${dig//\\})
+					[ $verbose -gt 1 ] && echo "Result: ${lookup[0]}=${lookup[4]}"
+					[ "${lookup[4]}" == "${a[4]}" ] && targetOK=TRUE
+					[ $( isIP ${lookup[4]} ) == YES ] && targetOK=TRUE
+				    fi
+				    ;;
+			    esac
+			fi
+			[ $verbose -gt 2 ] && echo "nameOK:$nameOK; ttlOK:$ttlOK; targetOK:$targetOK"
+			if [ $resultGiven == FALSE ]; then
+				if [ ! $nameOK == FALSE ] \
+				&& [ ! $ttlOK == FALSE ] \
+				&& [ ! $targetOK == FALSE ] && [ ! $targetOK == IPWrong ]; then
+					message=""
+					clr=$clrGreen
+					[ $targetOK == Maybe ] && clr=$clrBlue
+					[ $targetOK == IPWrong ] && clr=$clrRed
+					[ ${values[3]} == SOA ] && [ $targetOK == Maybe ] && message="$message (SOA not checked)"
+					[ $ttlOK == TTLWrong ] && message="$message ${clrAmber}(TTL Warning)"
+					[ ${values[3]} == MX ] && [ $MXlevelOK == FALSE ] && message="$message ${clrAmber}(MX Level Wrong)"
+					[ $RROK == FALSE ] && message="$message ${clrRed}(Record is ${a[3]})$clrOff"
+					if [ $c == 1 ]; then
+						echo -e "$clr --> OK $message $clrOff"
+					else
+						echo -e "$clr --> OK:$c $message $clrOff"
+					fi
+					resultGiven=TRUE
+					if [ "$rr" == "" ]; then
+						newName=${values[0]//\./$DOTreplace}
+						newName=${newName//\-/$HYPHENreplace}
+						newValue=${values[4]//\./$DOTreplace}
+						newValue=${newValue//\-/$HYPHENreplace}
+						declare "host$newName"="$newValue"
+						[ $verbose -gt 1 ] && echo -e "${clrRed}host$newName"="$newValue$clrOff"
+					fi
+				fi
+			fi
+		done
+		clr=$clrBlue
+		if [ $resultGiven == FALSE ]; then
+			message=""
+			[ $nameOK == FALSE ] &&  message="$message ${clrBlue}Name failed"
+			[ $ttlOK == FALSE ] &&  message="$message ${clrRed}TTL failed"
+			if [ $targetOK == FALSE ]; then
+				[ $ttlOK == TTLWrong ] &&  message="$message ${clrAmber}TTL wrong"
+				[ $targetOK == FALSE ] &&  message="$message ${clrRed}Target missing" 
+			fi
+			[ $targetOK == IPWrong ] &&  message="$message ${clrRed}Target incorrect" 
+			echo -e "$clrRed --> $message$clrOff"
+			clr=$clrRed
+		fi
+		if [ $resultGiven == FALSE ] || [ $showResult == TRUE ]; then
+			for answer in "${answers[@]}"; do
+				a=($answer)
+				echo -e "$clr${a[@]}$clrOff"
+			done
+		fi
+		lastName=${values[0]}
+		data=""
+
+	fi
+done < $zonefile
